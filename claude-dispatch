@@ -1,0 +1,190 @@
+#!/bin/zsh
+# claude-dispatch: move GitHub stories through Developer and Tester agents
+#
+# The board is labels (create once: for l in ready in-dev blocked needs-test
+# in-test tested changes-requested; do gh label create $l -R $REPO; done)
+#   issue: ready ─► in-dev ─► (PR opened)              failure ─► blocked
+#   PR:    needs-test ─► in-test ─► tested
+#                              └──► changes-requested ─► in-dev ─► needs-test …
+# Merging stays with you; a merged "Closes #N" PR closes the story.
+#
+# usage: claude-dispatch           poll GitHub forever
+#        claude-dispatch --once    one pass, wait for its jobs, exit
+# Pause new jobs (running ones finish): touch ~/.claude-dispatch/PAUSE
+
+REPO=owner/name                  # GitHub repo
+APPROVER=your-github-login       # only stories labelled `ready` by this user are picked up
+CLONE=/Volumes/Storage/workspace/name
+BASE=main
+MAX_DEV=2 MAX_TEST=1             # concurrent jobs per role
+MAX_MINUTES=45                   # kill a job that runs longer than this
+MAX_USD=5                        # spending cap per job (claude --max-budget-usd)
+POLL=60                          # seconds between passes
+
+zmodload zsh/datetime
+state=~/.claude-dispatch
+mkdir -p $state/jobs $state/logs $CLONE.worktrees
+
+log() { print -r -- "$(strftime '%F %T' $EPOCHSECONDS) $*" }
+
+# ── helpers ────────────────────────────────────────────────────────────────
+
+count() { local f=($state/jobs/$1-*(N)); print $#f }
+
+# True if the last `ready` label on issue $1 was added by $APPROVER, so an
+# agent (or anyone else) can't queue work on its own.
+approved() {
+  local who=$(gh api repos/$REPO/issues/$1/events --paginate \
+    -q '.[] | select(.event == "labeled" and .label.name == "ready") | .actor.login' | tail -1)
+  [[ $who == $APPROVER ]]
+}
+
+# Fresh worktree for <branch> at <dir>, from origin/<branch> if it exists, else origin/$BASE.
+# Worktrees belong to the agents: local changes that weren't pushed are discarded.
+checkout() {
+  local branch=$1 dir=$2 from=origin/$BASE
+  git -C $CLONE fetch -q origin
+  git -C $CLONE rev-parse -q --verify origin/$branch >/dev/null && from=origin/$branch
+  if [[ -d $dir ]]; then
+    git -C $dir checkout -q -B $branch $from && git -C $dir reset -q --hard $from && git -C $dir clean -qfd
+  else
+    git -C $CLONE worktree add -q -B $branch $dir $from
+  fi
+}
+
+# Run one headless Claude turn in <dir>; prints its final message.
+# Records Claude's pid in the job file so the watchdog can stop it.
+run_claude() {  # run_claude <jobfile> <dir> <prompt>
+  local json=$state/logs/${1:t}.json
+  cd $2 || return 1
+  claude -p $3 --dangerously-skip-permissions --max-budget-usd $MAX_USD --output-format json > $json &
+  print $! >> $1
+  wait $!
+  local rc=$?
+  jq -r '.result // empty' $json 2>/dev/null
+  return $rc
+}
+
+# ── jobs (each runs in the background, one per story/PR) ──────────────────
+
+dev_job() {  # dev_job <issue> <branch>
+  local n=$1 branch=$2 dir=$CLONE.worktrees/${2//\//-} job=$state/jobs/dev-$1
+  trap "rm -f $job" EXIT
+  checkout $branch $dir || { gh issue edit $n -R $REPO --remove-label in-dev --add-label blocked; return }
+
+  local result rc
+  result=$(run_claude $job $dir "You are the Developer agent for $REPO, working on branch $branch in this directory.
+Implement GitHub issue #$n. Read it first: gh issue view $n -R $REPO --comments
+If a pull request already exists for $branch, this is rework: read its reviews and comments
+(gh pr view $branch -R $REPO --comments) and address every point raised.
+Run the project's tests and make them pass. Commit with messages that reference #$n, then push $branch.
+If no pull request exists yet, open one: gh pr create -R $REPO --base $BASE --head $branch
+with a clear title and a body that starts with 'Closes #$n'.
+Do not merge, and do not change labels; the dispatcher does that.
+If you cannot finish, stop and explain what is blocking you in your final message.")
+  rc=$?
+
+  local pr=$(gh pr list -R $REPO --head $branch --json number -q '.[0].number')
+  if (( rc == 0 )) && [[ -n $pr ]]; then
+    gh pr edit $pr -R $REPO --add-label needs-test >/dev/null
+    gh pr edit $pr -R $REPO --remove-label in-dev >/dev/null 2>&1
+    log "dev #$n done: PR #$pr needs-test"
+  else
+    gh issue edit $n -R $REPO --remove-label in-dev --add-label blocked >/dev/null
+    gh issue comment $n -R $REPO --body "Developer agent stopped without a ready PR (exit $rc).
+
+${result[1,4000]}" >/dev/null
+    log "dev #$n blocked (exit $rc)"
+  fi
+}
+
+test_job() {  # test_job <pr> <branch>
+  local p=$1 branch=$2 dir=$CLONE.worktrees/${2//\//-} job=$state/jobs/test-$1
+  trap "rm -f $job" EXIT
+  checkout $branch $dir || { gh pr edit $p -R $REPO --remove-label in-test --add-label blocked; return }
+
+  local result rc
+  result=$(run_claude $job $dir "You are the Tester agent for $REPO. Pull request #$p is checked out here (branch $branch).
+Read it and the issue it closes: gh pr view $p -R $REPO --comments
+Check the change against the issue's acceptance criteria: run the full test suite, exercise the
+feature, and look for regressions and missing tests. Do not push or commit anything.
+Post your findings as one comment: gh pr comment $p -R $REPO --body '...'
+Be specific about anything that fails, so the Developer agent can fix it.
+The very last line of your final message must be exactly 'VERDICT: PASS' or 'VERDICT: FAIL'.")
+  rc=$?
+
+  local verdicts=(${(M)${(f)result}:#VERDICT: *}) verdict
+  verdict=${verdicts[-1]}
+  if (( rc == 0 )) && [[ $verdict == 'VERDICT: PASS' ]]; then
+    gh pr edit $p -R $REPO --remove-label in-test --add-label tested >/dev/null
+    log "test PR #$p passed"
+  elif (( rc == 0 )) && [[ $verdict == 'VERDICT: FAIL' ]]; then
+    gh pr edit $p -R $REPO --remove-label in-test --add-label changes-requested >/dev/null
+    log "test PR #$p failed: back to dev"
+  else
+    gh pr edit $p -R $REPO --remove-label in-test --add-label blocked >/dev/null
+    gh pr comment $p -R $REPO --body "Tester agent stopped without a verdict (exit $rc)." >/dev/null
+    log "test PR #$p blocked (exit $rc)"
+  fi
+}
+
+start() {  # start dev|test <number> <branch>
+  print -n "$EPOCHSECONDS " > $state/jobs/$1-$2    # claimed now, so count() sees it
+  log "start $1 #$2 ($3)"
+  ${1}_job $2 $3 >> $state/logs/$1-$2.log 2>&1 &
+}
+
+# ── one pass over the board ────────────────────────────────────────────────
+
+pass() {
+  local f started pid n p branch
+
+  # Stop jobs that ran too long; the job then labels its story/PR `blocked`
+  for f in $state/jobs/*(N); do
+    read -r started pid < $f
+    if [[ -n $pid ]] && (( EPOCHSECONDS - started > MAX_MINUTES * 60 )); then
+      log "timeout ${f:t} after $MAX_MINUTES min"
+      kill $pid 2>/dev/null
+    fi
+  done
+
+  [[ -e $state/PAUSE ]] && { log "paused (rm $state/PAUSE to resume)"; return }
+
+  # Testers first, so finished work doesn't queue behind new work
+  for p in $(gh pr list -R $REPO --label needs-test --json number -q '.[].number'); do
+    (( $(count test) < MAX_TEST )) || break
+    branch=$(gh pr view $p -R $REPO --json headRefName -q .headRefName)
+    gh pr edit $p -R $REPO --remove-label needs-test --add-label in-test >/dev/null
+    start test $p $branch
+  done
+
+  # Developers: rework from failed tests, then new stories
+  for p in $(gh pr list -R $REPO --label changes-requested --json number -q '.[].number'); do
+    (( $(count dev) < MAX_DEV )) || break
+    branch=$(gh pr view $p -R $REPO --json headRefName -q .headRefName)
+    n=${branch#story/}
+    [[ $n == <-> ]] || { log "skip PR #$p: branch $branch isn't story/<issue>"; continue }
+    gh pr edit $p -R $REPO --remove-label changes-requested --add-label in-dev >/dev/null
+    start dev $n $branch
+  done
+  for n in $(gh issue list -R $REPO --label ready --json number -q '.[].number'); do
+    (( $(count dev) < MAX_DEV )) || break
+    [[ -e $state/jobs/dev-$n ]] && continue
+    approved $n || { log "skip #$n: not labelled ready by $APPROVER"; continue }
+    gh issue edit $n -R $REPO --remove-label ready --add-label in-dev >/dev/null
+    start dev $n story/$n
+  done
+}
+
+# Jobs left over from a dispatcher that died mid-run: their labels are stuck
+# at in-dev/in-test, so say so instead of guessing
+for f in $state/jobs/*(N); do
+  log "stale job ${f:t}: the dispatcher stopped while it ran; fix its labels by hand"
+  rm -f $f
+done
+
+while true; do
+  pass
+  [[ $1 == --once ]] && { wait; break }
+  sleep $POLL
+done

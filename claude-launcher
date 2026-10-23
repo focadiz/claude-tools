@@ -1,0 +1,91 @@
+#!/bin/zsh
+# usage: claude-launcher <folder> [name]   open one project
+#        claude-launcher --save            record running Claude tmux sessions
+#        claude-launcher --all             reopen every recorded session
+list=~/.config/claude-launcher/projects    # one "folder<TAB>name" per line
+
+launch() {
+  local dir=${1:A} name=${2:-${1:A:t}}
+  [[ -d $dir ]] || { echo "no such folder: $1" >&2; return 1 }
+  name=${name//[.:]/-}         # tmux doesn't allow . or : in session names
+
+  local inner="claude --dangerously-skip-permissions --name ${(q)name} --remote-control ${(q)name}"
+  # Continue the folder's most recent conversation if it has one (Claude stores
+  # them under ~/.claude/projects/ with / and . in the path replaced by -)
+  local transcripts=(~/.claude/projects/${dir//[\/.]/-}/*.jsonl(N))
+  (( $#transcripts )) && inner+=" --continue"
+  local cmd="tmux new-session -A -s ${(q)name} -c ${(q)dir} ${(qq)inner}"
+
+  osascript -l JavaScript - "$cmd" <<'EOF'
+ObjC.import('AppKit');
+function run(argv) {
+  const scr  = $.NSScreen.mainScreen.visibleFrame;              // screen with focus, minus menu bar/Dock
+  const mainH = $.NSScreen.screens.objectAtIndex(0).frame.size.height;
+  const W = Math.round(scr.size.width * 0.5), H = Math.round(scr.size.height * 1.0);
+  const x = scr.origin.x + (scr.size.width - W) / 2;
+  // Cocoa measures from the bottom-left, iTerm from the top-left
+  const y = mainH - (scr.origin.y + scr.size.height) + (scr.size.height - H) / 2;
+
+  const iterm = Application('iTerm');
+  iterm.activate();
+  const win = iterm.createWindowWithDefaultProfile();
+  win.bounds = { x: x, y: y, width: W, height: H };
+  win.currentSession.write({ text: argv[0] });
+}
+EOF
+}
+
+case $1 in
+  --save)
+    # Every tmux session with a pane running Claude, keyed by the folder Claude runs in
+    mkdir -p ${list:h}
+    tmux list-panes -a -F $'#{pane_current_path}\t#{session_name}\t#{pane_current_command}' 2>/dev/null |
+      awk -F'\t' '$3 ~ /^claude/ { print $1 "\t" $2 }' | sort -u >| $list
+    echo "saved $(wc -l < $list | tr -d ' ') session(s) to $list:"
+    cut -f2 $list | sed 's/^/  /'
+
+    # Then wait until none of them is mid-turn. Claude's footer shows
+    # "esc to interrupt" while it is working. The pane running this script
+    # (e.g. Claude in mc calling it) is skipped, or it would wait on itself.
+    # Idle must hold for two checks in a row, so a gap between steps isn't
+    # mistaken for the end of a turn.
+    calm=0
+    while (( calm < 2 )); do
+      busy=()
+      tmux list-panes -a -F $'#{pane_id}\t#{session_name}\t#{pane_current_command}' |
+        while IFS=$'\t' read -r pane name command; do
+          [[ $command == claude* && $pane != $TMUX_PANE ]] || continue
+          tmux capture-pane -p -t $pane | grep -v '^[[:space:]]*$' | tail -3 |
+            grep -q 'esc to interrupt' && busy+=($name)
+        done
+      if (( $#busy )); then
+        calm=0
+        echo "waiting on: ${busy[*]}"
+        sleep 10
+      else
+        (( ++calm < 2 )) && sleep 5
+      fi
+    done
+    echo "all sessions idle; safe to restart"
+    ;;
+  --all)
+    [[ -s $list ]] || { echo "nothing saved yet; run: claude-launcher --save" >&2; exit 1 }
+    while IFS=$'\t' read -r dir name; do
+      # Skip sessions that are running and already shown in a window
+      attached=$(tmux display -p -t "=$name:" '#{session_attached}' 2>/dev/null)
+      if (( ${attached:-0} > 0 )); then
+        echo "skip   $name (already open)"
+        continue
+      fi
+      echo "open   $name"
+      launch $dir $name
+      sleep 1
+    done < $list
+    ;;
+  ''|-h|--help)
+    sed -n '2,4s/^# //p' $0
+    ;;
+  *)
+    launch "$@"
+    ;;
+esac

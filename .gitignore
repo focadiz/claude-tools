@@ -1,0 +1,9 @@
+# Never commit credentials or local state
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.token
+.DS_Store
+logs/
