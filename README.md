@@ -44,7 +44,8 @@ brew install claude-tools          # latest tagged release
 brew install --HEAD claude-tools   # or the latest main
 ```
 
-The repo is private, so this works on machines where git can already read it.
+Brew asks you to trust the tap the first time:
+`brew trust --formula focadiz/claude-tools/claude-tools`.
 
 ## Requirements
 
