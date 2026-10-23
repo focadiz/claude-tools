@@ -36,6 +36,17 @@ the script header), then try `claude-dispatch --once` on a test repo.
 Only stories labelled `ready` by `APPROVER` are picked up; each job is capped
 by time (`MAX_MINUTES`) and spend (`MAX_USD`), and nothing is ever merged.
 
+## Install
+
+```sh
+brew tap focadiz/claude-tools https://github.com/focadiz/claude-tools
+brew install claude-tools          # latest tagged release
+brew install --HEAD claude-tools   # or the latest main
+```
+
+The repo is private, so this works on machines where git can already read it.
+
 ## Requirements
 
 macOS, iTerm2, tmux, zsh, Claude Code; `gh` and `jq` for claude-dispatch.
+Brew installs tmux, gh and jq; iTerm2 and Claude Code you install yourself.
